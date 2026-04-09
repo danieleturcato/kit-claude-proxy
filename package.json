@@ -1,6 +1,6 @@
 {
   "name": "kit-claude-proxy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenAI-compatible proxy for Claude Code CLI — with content block support, tool calls, and improved error handling",
   "type": "module",
   "main": "dist/index.js",

@@ -8,6 +8,7 @@
 import express from 'express';
 import { handleChatCompletions, handleListModels, handleHealth } from './routes.js';
 import { getLogger, setLogLevel } from '../utils/logger.js';
+import { shutdownPool } from '../subprocess/pool.js';
 import { spawn } from 'child_process';
 const logger = getLogger();
 const DEFAULT_CONFIG = {
@@ -122,6 +123,8 @@ async function main() {
     // Graceful shutdown
     const shutdown = (signal) => {
         console.log(`\n${signal} received. Shutting down gracefully...`);
+        // Shutdown process pool first
+        shutdownPool();
         server.close(() => {
             console.log('Server closed.');
             process.exit(0);

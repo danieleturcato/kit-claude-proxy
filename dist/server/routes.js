@@ -1,50 +1,27 @@
 /**
- * API Route Handlers
+ * API Route Handlers - Improved Version with Process Pool & Retry
  *
- * Implements OpenAI-compatible endpoints
- * NEW: Better error handling with proper HTTP codes
- * NEW: Concurrency limiting
- * FIX: Proper content-type handling
+ * Implements OpenAI-compatible endpoints with:
+ * - Pre-warmed process pool for faster responses
+ * - Robust retry logic with exponential backoff
+ * - Full tool use support
+ * - Improved error handling
  */
 import { v4 as uuidv4 } from 'uuid';
-import { ClaudeSubprocess } from '../subprocess/manager.js';
+import { getProcessPool } from '../subprocess/pool.js';
 import { openaiToCli, extractModel } from '../adapter/openai-to-cli.js';
-import { cliResultToOpenai, parseToolCalls, createStreamChunk, createDoneChunk } from '../adapter/cli-to-openai.js';
+import { cliResultToOpenai, createStreamChunk, createDoneChunk } from '../adapter/cli-to-openai.js';
+import { extractToolCalls } from '../adapter/tool-parser.js';
+import { withRetry } from '../utils/retry.js';
 import { getLogger } from '../utils/logger.js';
 const logger = getLogger();
-// NEW: Semaphore for concurrency limiting
-class Semaphore {
-    permits;
-    waiters = [];
-    constructor(permits) {
-        this.permits = permits;
-    }
-    async acquire() {
-        if (this.permits > 0) {
-            this.permits--;
-            return;
-        }
-        return new Promise((resolve) => this.waiters.push(resolve));
-    }
-    release() {
-        if (this.waiters.length > 0) {
-            const waiter = this.waiters.shift();
-            waiter?.();
-        }
-        else {
-            this.permits++;
-        }
-    }
-}
-// NEW: Global semaphore (max concurrent requests)
-const requestSemaphore = new Semaphore(3);
+const pool = getProcessPool();
 /**
  * Handle POST /v1/chat/completions
+ * NEW: Uses process pool and retry logic
  */
 export async function handleChatCompletions(req, res) {
     const requestId = uuidv4().replace(/-/g, '').slice(0, 24);
-    // NEW: Acquire semaphore
-    await requestSemaphore.acquire();
     try {
         const body = req.body;
         const stream = body.stream === true;
@@ -70,12 +47,11 @@ export async function handleChatCompletions(req, res) {
         logger.debug('Resolved model', { requestModel: body.model, resolvedModel: model });
         // Convert to CLI input
         const cliInput = openaiToCli(body);
-        const subprocess = new ClaudeSubprocess();
         if (stream) {
-            await handleStreamingResponse(req, res, subprocess, cliInput, requestId, body.model);
+            await handleStreamingResponse(req, res, cliInput, requestId, body.model, model);
         }
         else {
-            await handleNonStreamingResponse(res, subprocess, cliInput, requestId, body.model);
+            await handleNonStreamingResponse(res, cliInput, requestId, body.model, model);
         }
     }
     catch (error) {
@@ -95,61 +71,81 @@ export async function handleChatCompletions(req, res) {
             });
         }
     }
-    finally {
-        // NEW: Always release semaphore
-        requestSemaphore.release();
-    }
 }
 /**
- * Handle streaming response (Server-Sent Events)
+ * Handle streaming response with retry logic
  */
-async function handleStreamingResponse(req, res, subprocess, cliInput, requestId, modelName) {
+async function handleStreamingResponse(req, res, cliInput, requestId, modelName, model) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     let textBuffer = '';
     let isFinished = false;
-    // Handle incoming chunks
-    subprocess.on('chunk', (chunk) => {
-        if (isFinished)
-            return;
-        textBuffer += chunk;
-        // Send as SSE
-        const streamChunk = createStreamChunk(requestId, modelName, { content: chunk });
-        res.write(`data: ${JSON.stringify(streamChunk)}\n\n`);
-    });
-    // Handle completion
-    subprocess.on('close', (code) => {
-        if (isFinished)
-            return;
-        isFinished = true;
-        if (code === 0 && textBuffer) {
-            // Parse tool calls if any
-            const { text, toolCalls } = parseToolCalls(textBuffer);
-            // Send final chunk with tool calls if present
-            if (toolCalls) {
-                const toolChunk = createStreamChunk(requestId, modelName, {}, 'tool_calls');
-                res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
-            }
-            else {
-                const doneChunk = createDoneChunk(requestId, modelName);
-                res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-            }
-            res.write('data: [DONE]\n\n');
-        }
-        else if (!res.headersSent) {
-            res.status(500).json({
-                error: {
-                    message: `Claude CLI exited with code ${code}`,
-                    type: "server_error",
-                },
+    try {
+        // Use retry logic for the entire operation
+        await withRetry(async () => {
+            const proc = await pool.acquire(model);
+            return new Promise((resolve, reject) => {
+                // Handle incoming chunks
+                proc.stdout?.on('data', (data) => {
+                    if (isFinished)
+                        return;
+                    const chunk = data.toString();
+                    textBuffer += chunk;
+                    // Send as SSE
+                    const streamChunk = createStreamChunk(requestId, modelName, { content: chunk });
+                    res.write(`data: ${JSON.stringify(streamChunk)}\n\n`);
+                });
+                // Handle completion
+                proc.on('close', (code) => {
+                    if (isFinished)
+                        return;
+                    isFinished = true;
+                    if (code === 0 && textBuffer) {
+                        // Parse tool calls if any
+                        const { text, toolCalls } = extractToolCalls(textBuffer);
+                        // Send final chunk with tool calls if present
+                        if (toolCalls) {
+                            const toolChunk = createStreamChunk(requestId, modelName, {}, 'tool_calls');
+                            res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
+                        }
+                        else {
+                            const doneChunk = createDoneChunk(requestId, modelName);
+                            res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+                        }
+                        res.write('data: [DONE]\n\n');
+                        pool.release(proc, model);
+                        resolve();
+                    }
+                    else {
+                        pool.release(proc, model);
+                        reject(new Error(`Claude CLI exited with code ${code}`));
+                    }
+                });
+                // Handle errors
+                proc.on('error', (error) => {
+                    logger.error('Streaming error', { error: error.message });
+                    pool.release(proc, model);
+                    reject(error);
+                });
+                // Send prompt
+                proc.stdin?.write(cliInput.prompt + '\n', (err) => {
+                    if (err) {
+                        reject(err);
+                    }
+                    else {
+                        proc.stdin?.end();
+                    }
+                });
             });
-        }
-        res.end();
-    });
-    // Handle errors
-    subprocess.on('error', (error) => {
-        logger.error('Streaming error', { error: error.message });
+        }, {
+            maxAttempts: 3,
+            initialDelay: 500,
+            retryableErrors: ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'exited with code'],
+        });
+    }
+    catch (error) {
+        logger.error('Streaming failed after retries', { error: error.message });
         if (!res.headersSent) {
             res.status(500).json({
                 error: {
@@ -159,139 +155,113 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
             });
         }
         res.end();
-    });
-    // Start subprocess
-    await subprocess.start(cliInput.prompt, {
-        model: cliInput.model,
-        sessionId: requestId,
-        system: cliInput.system,
-    });
+    }
 }
 /**
- * Handle non-streaming response
+ * Handle non-streaming response with retry logic
  */
-async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, modelName) {
-    return new Promise((resolve) => {
-        let finalResult = null;
-        let error = null;
-        subprocess.on('result', (result) => {
-            // Parse tool calls from result
-            const { text, toolCalls } = parseToolCalls(result.text);
-            finalResult = { text, toolCalls };
-        });
-        subprocess.on('error', (err) => {
-            error = err;
-        });
-        subprocess.on('close', (code) => {
-            if (error) {
-                logger.error('Subprocess error', { error: error.message });
-                res.status(500).json({
-                    error: {
-                        message: error.message,
-                        type: "server_error",
-                    },
+async function handleNonStreamingResponse(res, cliInput, requestId, modelName, model) {
+    try {
+        const result = await withRetry(async () => {
+            const proc = await pool.acquire(model);
+            return new Promise((resolve, reject) => {
+                let output = '';
+                let errorOutput = '';
+                proc.stdout?.on('data', (data) => {
+                    output += data.toString();
                 });
-            }
-            else if (finalResult) {
-                const result = cliResultToOpenai({
-                    text: finalResult.text,
-                    toolCalls: finalResult.toolCalls,
-                    finishReason: finalResult.toolCalls ? 'tool_calls' : 'stop',
-                }, requestId);
-                // Override model name
-                result.model = modelName;
-                res.json(result);
-            }
-            else {
-                res.status(500).json({
-                    error: {
-                        message: `Claude CLI exited with code ${code} without response`,
-                        type: "server_error",
-                    },
+                proc.stderr?.on('data', (data) => {
+                    errorOutput += data.toString();
                 });
-            }
-            resolve();
-        });
-        // Start subprocess
-        subprocess.start(cliInput.prompt, {
-            model: cliInput.model,
-            sessionId: requestId,
-            system: cliInput.system,
-        }).catch((err) => {
-            logger.error('Failed to start subprocess', { error: err.message });
-            res.status(500).json({
-                error: {
-                    message: err.message,
-                    type: "server_error",
-                },
+                proc.on('close', (code) => {
+                    pool.release(proc, model);
+                    if (code === 0) {
+                        // Parse tool calls from output
+                        const { text, toolCalls } = extractToolCalls(output);
+                        resolve({ text, toolCalls });
+                    }
+                    else {
+                        reject(new Error(`Claude CLI exited with code ${code}: ${errorOutput || output}`));
+                    }
+                });
+                proc.on('error', (err) => {
+                    pool.release(proc, model);
+                    reject(err);
+                });
+                // Send prompt
+                proc.stdin?.write(cliInput.prompt + '\n', (err) => {
+                    if (err) {
+                        reject(err);
+                    }
+                    else {
+                        proc.stdin?.end();
+                    }
+                });
             });
-            resolve();
+        }, {
+            maxAttempts: 3,
+            initialDelay: 500,
+            retryableErrors: ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'exited with code'],
         });
-    });
+        // Format response
+        const response = cliResultToOpenai({
+            text: result.text,
+            toolCalls: result.toolCalls,
+            finishReason: result.toolCalls ? 'tool_calls' : 'stop',
+        }, requestId);
+        // Override model name
+        response.model = modelName;
+        res.json(response);
+    }
+    catch (error) {
+        logger.error('Request failed after retries', { error: error.message });
+        res.status(500).json({
+            error: {
+                message: error.message,
+                type: "server_error",
+            },
+        });
+    }
 }
 /**
  * Handle GET /v1/models
- * NEW: Returns proper OpenAI-compatible model list
  */
 export function handleListModels(req, res) {
     logger.debug('List models request');
     res.json({
         object: 'list',
         data: [
-            {
-                id: 'claude-opus-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
-            {
-                id: 'claude-sonnet-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
-            {
-                id: 'claude-haiku-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
-            // Provider-prefixed variants
-            {
-                id: 'claude-proxy/claude-opus-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
-            {
-                id: 'claude-proxy/claude-sonnet-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
-            {
-                id: 'claude-proxy/claude-haiku-4',
-                object: 'model',
-                created: Math.floor(Date.now() / 1000),
-                owned_by: 'anthropic',
-            },
+            { id: 'claude-opus-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
+            { id: 'claude-sonnet-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
+            { id: 'claude-haiku-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
+            { id: 'claude-proxy/claude-opus-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
+            { id: 'claude-proxy/claude-sonnet-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
+            { id: 'claude-proxy/claude-haiku-4', object: 'model', created: Date.now(), owned_by: 'anthropic' },
         ],
     });
 }
 /**
  * Handle GET /health
- * NEW: Enhanced health check with version info
+ * NEW: Shows pool statistics
  */
 export function handleHealth(req, res) {
+    const stats = pool.getStats();
     res.json({
         status: 'ok',
         provider: 'kit-claude-proxy',
-        version: process.env.npm_package_version || '1.0.0',
+        version: '1.1.0',
         timestamp: new Date().toISOString(),
+        pool: {
+            total: stats.total,
+            ready: stats.ready,
+            inUse: stats.inUse,
+        },
         features: {
             streaming: true,
             tool_calls: true,
             system_prompts: true,
+            retry_logic: true,
+            process_pool: true,
         },
     });
 }

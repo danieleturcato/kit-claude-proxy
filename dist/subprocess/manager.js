@@ -25,12 +25,9 @@ export class ClaudeSubprocess extends EventEmitter {
         const args = [
             '--print',
             '--model', options.model,
-            '--output-format', 'stream-json',
         ];
-        // NEW: Use --system flag if system prompt provided
-        if (options.system) {
-            args.push('--system', options.system);
-        }
+        // NOTE: Claude CLI doesn't support --system flag
+        // System prompt is handled in openai-to-cli.ts by wrapping in the prompt
         logger.debug('Spawning Claude CLI', {
             model: options.model,
             promptLength: prompt.length,
@@ -46,12 +43,13 @@ export class ClaudeSubprocess extends EventEmitter {
         });
         // Handle stdout (JSON streaming)
         this.process.stdout?.on('data', (data) => {
+            logger.debug('STDOUT raw', { data: data.toString().slice(0, 100) });
             this.handleStdout(data.toString());
         });
         // Handle stderr
         this.process.stderr?.on('data', (data) => {
             const stderr = data.toString();
-            logger.warn('Claude CLI stderr', { stderr: stderr.slice(0, 200) });
+            logger.info('STDERR', { stderr: stderr.slice(0, 500) });
         });
         // Handle process exit
         this.process.on('close', (code) => {
@@ -92,12 +90,14 @@ export class ClaudeSubprocess extends EventEmitter {
      */
     handleStdout(data) {
         this.buffer += data;
+        logger.debug('Raw stdout data', { data: data.slice(0, 200) });
         // Process complete lines (JSON events)
         const lines = this.buffer.split('\n');
         this.buffer = lines.pop() || ''; // Keep incomplete line in buffer
         for (const line of lines) {
             if (!line.trim())
                 continue;
+            logger.debug('Processing line', { line: line.slice(0, 100) });
             try {
                 const event = JSON.parse(line);
                 this.handleStreamEvent(event);
